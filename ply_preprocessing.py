@@ -222,17 +222,16 @@ def majority_assign_final_colors(points3D, all_colors, all_labels):
             point_final_labels[point_id] = np.array(max_value)
             point_final_colors[point_id] = np.array(max_color)
     
-    # Update point cloud colors to final colors
-    for point_id, color in point_final_colors.items():
-        points3D[point_id][3:6] = color  # Update RGB colors
+    # Create a new points3D dictionary with a consistent output format:
+    # (x, y, z, r, g, b, label)
+    new_points3D = {}
+    for point_id, point_data in points3D.items():
+        x, y, z, r, g, b = point_data[:6]
+        r_new, g_new, b_new = point_final_colors.get(point_id, (r, g, b))
+        label = point_final_labels.get(point_id, 0)
+        new_points3D[point_id] = (x, y, z, r_new, g_new, b_new, label)
 
-        # Update point cloud labels
-        label = point_final_labels[point_id]
-        
-        # Add label as the 7th dimension
-        points3D[point_id] = np.concatenate((points3D[point_id], [label]))
-
-    return points3D
+    return new_points3D
 
 def prob_assign_final_colors(points3D, all_colors, all_labels):
     """Assign final colors using probability-based voting.
@@ -283,17 +282,16 @@ def prob_assign_final_colors(points3D, all_colors, all_labels):
             point_final_labels[point_id] = np.array(sampled_label)
             point_final_colors[point_id] = np.array(sampled_color)
     
-    # Update point cloud colors to final colors
-    for point_id, color in point_final_colors.items():
-        points3D[point_id][3:6] = color  # Update RGB colors
+    # Create a new points3D dictionary with a consistent output format:
+    # (x, y, z, r, g, b, label)
+    new_points3D = {}
+    for point_id, point_data in points3D.items():
+        x, y, z, r, g, b = point_data[:6]
+        r_new, g_new, b_new = point_final_colors.get(point_id, (r, g, b))
+        label = point_final_labels.get(point_id, 0)
+        new_points3D[point_id] = (x, y, z, r_new, g_new, b_new, label)
 
-        # Update point cloud labels
-        label = point_final_labels[point_id]
-        
-        # Add label as the 7th dimension
-        points3D[point_id] = np.concatenate((points3D[point_id], [label]))
-
-    return points3D
+    return new_points3D
 
 def storePly(path, xyz, rgb, label):
     """Save point cloud data to PLY file format.
@@ -610,6 +608,9 @@ def main(args):
         print(f"Processing {dataset_folder}...")
         label_image_dir = os.path.join(dataset_path, dataset_folder, 'object_mask')
         color_image_dir = os.path.join(dataset_path, dataset_folder, 'color_mask')
+        # Check if ‘color_mask’ directory exists, if not set to None
+        if not os.path.isdir(color_image_dir):
+            color_image_dir = None
         output_ply_path = os.path.join(dataset_path, dataset_folder, 'sparse/0/' + args.output_ply_name)
 
         # Try to load binary COLMAP files first, then fall back to text files
