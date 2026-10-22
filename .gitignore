@@ -21,4 +21,5 @@ Grounded-SAM-2
 output*
 # *.sh
 demo
-mesh
+meshTracking-Anything-with-DEVA/saves/
+*.pth
