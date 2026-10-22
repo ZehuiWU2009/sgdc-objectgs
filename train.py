@@ -112,6 +112,40 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
     
+    # ==================== ADDED: Semantic Density Controller ====================
+    controller = None
+    if hasattr(opt, 'semantic_density_control_start') and opt.semantic_density_control_start > 0:
+        from semantic_density_control import SemanticDensityController
+        controller = SemanticDensityController(
+            classifier=None,
+            fixed_split_threshold=opt.fixed_split_threshold,
+            split_quantile=opt.split_quantile,
+            prune_quantile=opt.prune_quantile,
+            prune_abs_threshold=opt.prune_abs_threshold,
+            min_points_per_instance=opt.min_points_per_instance,
+            filter_low_confidence=opt.filter_low_confidence,
+            confidence_threshold=opt.confidence_threshold,
+            anneal_enable=opt.anneal_enable,
+            anneal_start_iter=opt.anneal_start_iter,
+            anneal_end_iter=opt.anneal_end_iter,
+            anneal_target_factor=opt.anneal_target_factor,
+            device="cuda",
+            ablation_semantic=1,
+            ablation_instance_split=opt.ablation_instance_split,
+            ablation_gradient_prune=opt.ablation_gradient_prune,
+            bg_split_quantile=opt.bg_split_quantile if hasattr(opt, 'bg_split_quantile') else 0.95
+        )
+        logger.info(f"[SADC] Controller initialized: start={opt.semantic_density_control_start}, "
+                    f"interval={opt.semantic_density_interval}, anneal={opt.anneal_start_iter}-{opt.anneal_end_iter}")
+    # ============================================================================
+    
+    # ===== ADDED: GPU Memory & Timing Stats =====
+    torch.cuda.reset_peak_memory_stats()
+    train_start_time = time.time()
+    total_sadc_time = 0.0
+    sadc_call_count = 0
+    # ============================================
+    
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
     
@@ -184,21 +218,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         # Object loss
         if opt.lambda_object_loss > 0:
-            # object_loss = 0.0
-            # for label in gaussians.label_ids.unique():
-            #     if label > 0:
-            #         object_mask = (gaussians.label_ids.squeeze() == label) & visible_mask
-            #         object_render_pkg = getattr(modules, 'render')(viewpoint_cam, gaussians, pipe, scene.background, visible_mask=object_mask)
-            #         render_image, render_alpha = object_render_pkg["render"], object_render_pkg["render_alphas"]
-            #         gt_object_mask = (viewpoint_cam.object_mask.cuda() == label).expand_as(gt_image)
-            #         if gt_object_mask.sum() > 0:
-            #             object_loss += l1_loss(gt_image[gt_object_mask], render_image[gt_object_mask])
-            #             object_loss += 1.0 * l1_loss(gt_object_mask.float(), render_alpha)
-            # losses["object_loss"] = opt.lambda_object_loss * object_loss
             gt_object_ids = gaussians.id_encoder.label_to_index(viewpoint_cam.object_mask.cuda()).long()
-            object_loss = torch.nn.CrossEntropyLoss(ignore_index=0, reduction='mean')(semantics.permute(0,3,1,2), gt_object_ids.unsqueeze(0))
-            # object_loss = torch.nn.CrossEntropyLoss(reduction='mean')(semantics.permute(0,3,1,2), gt_object_ids.unsqueeze(0))
-            losses["object_loss"] = opt.lambda_object_loss * object_loss
+            
+            valid_mask = (gt_object_ids != 0)
+            if valid_mask.any():
+                object_loss = torch.nn.CrossEntropyLoss(ignore_index=0, reduction='mean')(
+                    semantics.permute(0,3,1,2), gt_object_ids.unsqueeze(0)
+                )
+                losses["object_loss"] = opt.lambda_object_loss * object_loss
+            else:
+                losses["object_loss"] = torch.tensor(0.0, device="cuda", requires_grad=False)
 
             prob_zero_class = semantics[..., 0]  
             losses["zero_penalty"] = opt.lambda_zero_penalty * prob_zero_class.mean()
@@ -247,7 +276,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     
         total_loss = sum(losses.values())
         total_loss.backward()
-        
+
+        # ===== ADDED: 累积锚点梯度（用于 SADC 决策） =====
+        # 必须在 backward() 之后、optimizer.step() 之前执行
+        if hasattr(gaussians, '_anchor_grad_accum') and gaussians._anchor.grad is not None:
+            # 使用 detach() 避免累积 buffer 被计入计算图
+            grad = gaussians._anchor.grad.detach()
+            gaussians._anchor_grad_accum += grad
+            gaussians._anchor_denom += 1
+        # ===============================================
+
         iter_end.record()
 
         with torch.no_grad():
@@ -290,9 +328,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 other_img = []
                 resolution = (int(viewpoint_cam.image_width/1.0), int(viewpoint_cam.image_height/1.0))
                 vis_img = F.interpolate(vis_image.unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
-                # vis_gt_img = F.interpolate(gt_image.unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
-                # vis_alpha = F.interpolate(alpha.repeat(3, 1, 1).unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
-
 
                 if iteration > opt.start_depth and viewpoint_cam.invdepthmap is not None:
                     vis_depth = visualize_depth(invDepth) 
@@ -304,25 +339,106 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 grid = torchvision.utils.make_grid([
                     vis_img, 
-                    # vis_gt_img, 
-                    # vis_alpha,
                 ] + other_img, nrow=1)
 
                 vis_path = os.path.join(scene.model_path, "vis")
                 os.makedirs(vis_path, exist_ok=True)
                 torchvision.utils.save_image(grid, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
             
-            # densification
+            # ==================== MODIFIED: Densification with SADC + Native Fallback ====================
             if iteration < opt.update_until and iteration > opt.start_stat:
-                # add statis
                 gaussians.training_statis(opt, render_pkg, image.shape[2], image.shape[1])
                 densify_cnt += 1 
 
-                # densification
-                if opt.densification and iteration > opt.update_from and densify_cnt > 0 and densify_cnt % opt.update_interval == 0:
+                if opt.densification and iteration > opt.update_from and densify_cnt > 0:
                     if dataset.pretrained_checkpoint != "":
                         gaussians.roll_back()
-                    gaussians.run_densify(opt, iteration)
+                    
+                    # ===== MODIFIED: SADC阶段 (4000-15000轮) 每500轮 =====
+                    if iteration < opt.anneal_end_iter:
+                        use_sadc = (controller is not None and 
+                                    iteration >= opt.semantic_density_control_start and
+                                    iteration % opt.semantic_density_interval == 0)
+                        
+                        if use_sadc:
+                            try:
+                                torch.cuda.synchronize()
+                                t_sadc_start = time.time()
+                                
+                                labels = controller.compute_semantic_labels(gaussians, iteration)
+                                split_mask, prune_mask = controller.compute_split_prune_masks(
+                                    gaussians, labels, iteration
+                                )
+                                old_cnt = len(gaussians.get_anchor)
+                                gaussians.run_densify(opt, iteration, ext_split_mask=split_mask, ext_prune_mask=prune_mask)
+                                
+                                torch.cuda.synchronize()
+                                sadc_time = time.time() - t_sadc_start
+                                total_sadc_time += sadc_time
+                                sadc_call_count += 1
+                                
+                                new_cnt = len(gaussians.get_anchor)
+                                logger.info(f"[SADC] Iter {iteration}: anchor {old_cnt}->{new_cnt}, "
+                                          f"split={split_mask.sum().item()}, prune={prune_mask.sum().item()}, "
+                                          f"time={sadc_time*1000:.1f}ms")
+                            except Exception as e:
+                                logger.warning(f"[SADC] failed: {e}")
+                                controller.reset()
+                        elif iteration < opt.semantic_density_control_start:
+                            # SADC启动前（4000轮前）：运行原生densify每100轮
+                            if densify_cnt % opt.update_interval == 0:
+                                gaussians.run_densify(opt, iteration)
+                    else:
+                        # ===== 15000轮后：仅进行不透明度剪枝（手动更新所有统计量） =====
+                        if densify_cnt % opt.update_interval == 0:
+                            # 计算平均不透明度
+                            avg_opacity = gaussians.anchor_opacity_accum / (gaussians.anchor_demon + 1e-8)
+                            prune_mask = (avg_opacity < 0.005).squeeze()
+                            if prune_mask.sum() > 0:
+                                old_cnt = len(gaussians.get_anchor)
+                                
+                                # 1. 执行锚点剪枝
+                                gaussians.prune_anchor(prune_mask)
+                                
+                                # 2. 手动更新偏移统计量（与 run_densify 中的逻辑一致）
+                                # offset_denom
+                                offset_denom = gaussians.offset_denom.view([-1, gaussians.n_offsets])[~prune_mask]
+                                offset_denom = offset_denom.view([-1, 1])
+                                gaussians.offset_denom = offset_denom
+
+                                # offset_gradient_accum
+                                offset_gradient_accum = gaussians.offset_gradient_accum.view([-1, gaussians.n_offsets])[~prune_mask]
+                                offset_gradient_accum = offset_gradient_accum.view([-1, 1])
+                                gaussians.offset_gradient_accum = offset_gradient_accum
+                                
+                                # offset_opacity_accum
+                                offset_opacity_accum = gaussians.offset_opacity_accum.view([-1, gaussians.n_offsets])[~prune_mask]
+                                offset_opacity_accum = offset_opacity_accum.view([-1, 1])
+                                gaussians.offset_opacity_accum = offset_opacity_accum
+                                
+                                # 3. 更新锚点统计量
+                                temp_opacity_accum = gaussians.anchor_opacity_accum[~prune_mask]
+                                gaussians.anchor_opacity_accum = temp_opacity_accum
+                                temp_anchor_demon = gaussians.anchor_demon[~prune_mask]
+                                gaussians.anchor_demon = temp_anchor_demon
+                                
+                                # 4. 重置 max_radii2D
+                                gaussians.max_radii2D = torch.zeros(
+                                    gaussians.get_anchor.shape[0] * gaussians.n_offsets,
+                                    dtype=torch.float,
+                                    device="cuda"
+                                )
+                                
+                                # 5. 重置 _anchor_mask（确保下一次渲染正确）
+                                gaussians._anchor_mask = torch.ones(
+                                    gaussians.get_anchor.shape[0],
+                                    dtype=torch.bool,
+                                    device="cuda"
+                                )
+                                
+                                new_cnt = len(gaussians.get_anchor)
+                                logger.info(f"[Post-15000] Opacity prune: {old_cnt}->{new_cnt}, pruned={prune_mask.sum().item()}")
+            # ========================================================================
             
             elif iteration == opt.update_until:
                 if dataset.pretrained_checkpoint != "":
@@ -340,6 +456,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+    
+    # ===== ADDED: Training Stats Summary =====
+    train_total_time = time.time() - train_start_time
+    peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    peak_mem_gb = peak_mem_mb / 1024
+
+    logger.info(f"\n{'='*50}")
+    logger.info(f"Training Complete Stats:")
+    logger.info(f"  Total Time: {train_total_time/60:.2f} min ({train_total_time:.1f} s)")
+    logger.info(f"  Peak GPU Memory: {peak_mem_gb:.2f} GB ({peak_mem_mb:.1f} MB)")
+    if sadc_call_count > 0:
+        logger.info(f"  SADC Calls: {sadc_call_count}")
+        logger.info(f"  SADC Total Time: {total_sadc_time:.2f} s")
+        logger.info(f"  SADC Avg Time: {total_sadc_time/sadc_call_count*1000:.2f} ms/call")
+        logger.info(f"  SADC Overhead: {total_sadc_time/train_total_time*100:.2f}%")
+    logger.info(f"{'='*50}\n")
+
+    stats = {
+        "total_train_time_sec": train_total_time,
+        "peak_gpu_memory_mb": float(peak_mem_mb),
+        "peak_gpu_memory_gb": float(peak_mem_gb),
+    }
+    if sadc_call_count > 0:
+        stats.update({
+            "sadc_calls": sadc_call_count,
+            "sadc_total_time_sec": total_sadc_time,
+            "sadc_avg_time_ms": total_sadc_time / sadc_call_count * 1000,
+            "sadc_overhead_percent": total_sadc_time / train_total_time * 100,
+        })
+    with open(os.path.join(scene.model_path, "train_stats.json"), 'w') as f:
+        json.dump(stats, f, indent=2)
+    # =========================================
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -539,8 +687,6 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument('--use_wandb', action='store_true', default=False)
-    # parser.add_argument("--test_iterations", nargs="+", type=int, default=[80000,90000,100000])
-    # parser.add_argument("--save_iterations", nargs="+", type=int, default=[80000,90000,100000])
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[-1])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[-1])
     parser.add_argument("--quiet", action="store_true")
@@ -572,13 +718,11 @@ if __name__ == "__main__":
 
     if args.test_iterations[0] == -1:
         args.test_iterations = [i for i in range(10000, op.iterations + 1, 10000)]
-        # args.test_iterations = [i for i in range(5000, op.iterations + 1, 5000)]
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
         args.test_iterations.append(op.iterations)
 
     if args.save_iterations[0] == -1:
         args.save_iterations = [i for i in range(10000, op.iterations + 1, 10000)]
-        # args.save_iterations = [i for i in range(5000, op.iterations + 1, 5000)]
     if len(args.save_iterations) == 0 or args.save_iterations[-1] != op.iterations:
         args.save_iterations.append(op.iterations)
 
@@ -587,19 +731,12 @@ if __name__ == "__main__":
         os.system("echo $CUDA_VISIBLE_DEVICES")
         logger.info(f'using GPU {args.gpu}')
 
-    # try:
-    #     saveRuntimeCode(os.path.join(lp.model_path, 'backup'))
-    # except:
-    #     logger.info(f'save code failed~')
-    
     exp_name = lp.exp_name if lp.dataset_name=="" else lp.dataset_name+"_"+lp.exp_name
     if args.use_wandb:
         wandb.login()
         run = wandb.init(
-            # Set the project where this run will be logged
             project=f"Horizon-GS",
             name=exp_name,
-            # Track hyperparameters and run metadata
             settings=wandb.Settings(start_method="fork"),
             config=vars(args)
         )
@@ -612,7 +749,6 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     training(lp, op, pp, exp_name, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, wandb, logger)

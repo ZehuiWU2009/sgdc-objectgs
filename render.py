@@ -57,27 +57,43 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background):
     if vis_semantic:
         semantic_gt_path = os.path.join(model_path, name, "ours_{}".format(iteration), "semantic_gt")
         semantic_path = os.path.join(model_path, name, "ours_{}".format(iteration), "semantic")
-        # vis_semantic_path = os.path.join(model_path, name, "ours_{}".format(iteration), "semantic_vis") 
         makedirs(semantic_gt_path, exist_ok=True)   
         makedirs(semantic_path, exist_ok=True)
-        # makedirs(vis_semantic_path, exist_ok=True)
 
     modules = __import__('gaussian_renderer')
     
+    # ===== ADDED: FPS & Memory Stats =====
+    torch.cuda.reset_peak_memory_stats()
     t_list = []
+    t_list_seg = []
+    # =====================================
+    
     visible_count_list = []
     per_view_dict = {}
     for idx, view in enumerate(tqdm(views, desc="rendering progress")):
         
-        torch.cuda.synchronize();t_start = time.time()
+        # ---- RGB Only ----
+        torch.cuda.synchronize()
+        t_start = time.time()
         render_pkg = getattr(modules, 'render')(view, gaussians, pipe, background)
-        torch.cuda.synchronize();t_end = time.time()
-
-        t_list.append(t_end - t_start)
+        torch.cuda.synchronize()
+        t_rgb_end = time.time()
 
         # renders
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = render_pkg["visibility_filter"].sum()
+
+        # ---- RGB + Seg ----
+        if vis_semantic:
+            semantic_map = render_pkg["render_semantics"]
+            object_id = gaussians.id_encoder.inverse_transform(semantic_map)
+            if object_id.dim() == 3:
+                object_id = object_id.squeeze(0)
+        torch.cuda.synchronize()
+        t_seg_end = time.time()
+        
+        t_list.append(t_rgb_end - t_start)
+        t_list_seg.append(t_seg_end - t_start)
 
         # gts
         gt = view.original_image.cuda()
@@ -110,11 +126,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background):
             semantic_map = render_pkg["render_semantics"]
             object_id = gaussians.id_encoder.inverse_transform(semantic_map)
             imageio.imwrite(os.path.join(semantic_path, '{0:05d}'.format(idx) + ".png"), object_id.squeeze().cpu().numpy())
-            # vis_semantic_map = gaussians.id_encoder.visualize(semantic_map)
-            # imageio.imwrite(os.path.join(vis_semantic_path, '{0:05d}'.format(idx) + ".png"), vis_semantic_map.squeeze().cpu().numpy())
 
         save_rgba(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        # save_rgba(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
         save_mask(object_mask, os.path.join(semantic_gt_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         visible_count_list.append(visible_count)
@@ -122,6 +135,35 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background):
 
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
         json.dump(per_view_dict, fp, indent=True)
+
+    # ===== ADDED: FPS & Memory Stats Output =====
+    if len(t_list) > 0:
+        avg_rgb_ms = np.mean(t_list) * 1000
+        avg_seg_ms = np.mean(t_list_seg) * 1000
+        fps_rgb = 1.0 / np.mean(t_list)
+        fps_seg = 1.0 / np.mean(t_list_seg)
+        peak_mem_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        
+        print(f"\n{'='*50}")
+        print(f"Rendering Stats ({name}, {len(views)} frames):")
+        print(f"  RGB Only:   {fps_rgb:.2f} FPS ({avg_rgb_ms:.2f} ms/frame)")
+        print(f"  RGB + Seg:  {fps_seg:.2f} FPS ({avg_seg_ms:.2f} ms/frame)")
+        print(f"  Peak Memory: {peak_mem_mb:.1f} MB")
+        print(f"{'='*50}\n")
+        
+        render_stats = {
+            "dataset": name,
+            "num_frames": len(views),
+            "fps_rgb": float(fps_rgb),
+            "fps_rgb_seg": float(fps_seg),
+            "avg_ms_rgb": float(avg_rgb_ms),
+            "avg_ms_rgb_seg": float(avg_seg_ms),
+            "peak_memory_mb": float(peak_mem_mb),
+        }
+        stats_path = os.path.join(model_path, name, f"ours_{iteration}", "render_stats.json")
+        with open(stats_path, 'w') as f:
+            json.dump(render_stats, f, indent=2)
+    # ============================================
 
     return visible_count_list
 
@@ -134,7 +176,6 @@ def render_sets(dataset, opt, pipe, iteration, skip_train, skip_test, explicit=N
             pipe.add_prefilter = True
         modules = __import__('scene')
         model_config = dataset.model_config
-        # model_config['kwargs']['ape_code'] = ape_code
         gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, explicit=explicit, logger=logger)
         gaussians.eval()

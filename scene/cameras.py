@@ -108,13 +108,13 @@ class Camera(nn.Module):
         self.c2w = self.world_view_transform.transpose(0, 1).inverse()
 
         if "3dovs" in image_path:
-            object_mask = Image.open(image_path.replace("images", "object_mask_deva").replace(".jpg", ".png")).convert('L')
+            object_mask = Image.open(image_path.replace("images", "object_mask_deva").replace(".JPG", ".png")).convert('L')
         elif "replica" in image_path:
-            object_mask = Image.open(image_path.replace("images_all", "object_mask").replace(".jpg", ".png")).convert('L')
+            object_mask = Image.open(image_path.replace("images_all", "object_mask").replace(".JPG", ".png")).convert('L')
         elif "scannet" in image_path:
             object_mask = Image.open(image_path.replace("images", "object_mask").replace(".JPG", ".png")).convert('L')
         else:
-            object_mask = Image.open(image_path.replace("images", "object_mask").replace(".jpg", ".png")).convert('L')
+            object_mask = Image.open(image_path.replace("images", "object_mask").replace(".JPG", ".png")).convert('L')
         # Object IDs are categorical values, so interpolating them can create
         # labels that do not exist in the source mask.
         object_mask = np.array(

@@ -19,10 +19,10 @@
 </p>
 
 <div align="center">
-  <a href='https://arxiv.org/abs/2507.15454'><img src='https://img.shields.io/badge/arXiv-2507.15454-b31b1b.svg'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href='https://ruijiezhu94.github.io/ObjectGS_page/'><img src='https://img.shields.io/badge/Project-Page-orange'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <!-- <a href='https://ruijiezhu94.github.io/ObjectGS_page/'><img src='https://img.shields.io/badge/YouTube-Demo-yellow'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;  -->
-  <a href='https://github.com/RuijieZhu94/ObjectGS?tab=MIT-1-ov-file'><img src='https://img.shields.io/badge/License-MIT-green'></a> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href='https://arxiv.org/abs/2507.15454'><img src='https://img.shields.io/badge/arXiv-2507.15454-b31b1b.svg'></a>      
+  <a href='https://ruijiezhu94.github.io/ObjectGS_page/'><img src='https://img.shields.io/badge/Project-Page-orange'></a>      
+  <!-- <a href='https://ruijiezhu94.github.io/ObjectGS_page/'><img src='https://img.shields.io/badge/YouTube-Demo-yellow'></a>        -->
+  <a href='https://github.com/RuijieZhu94/ObjectGS?tab=MIT-1-ov-file'><img src='https://img.shields.io/badge/License-MIT-green'></a>      
   <a href='https://ruijiezhu94.github.io/ObjectGS'><img src="https://visitor-badge.laobi.icu/badge?page_id=ruijiezhu94.objectgs"/></a>
   <br>
   <br>
@@ -36,11 +36,12 @@
 
 > The overall architecture of ObjectGS. We first use a 2D segmentation pipeline to assign object ID and lift it to 3D. Then we initialize the anchors and use them to generate object-aware neural Gaussians. To provide semantic guidance, we model the Gaussian semantics and construct classification-based constraints. As a result, our method enables both object-level and scene-level reconstruction.
 
-
 ## 🚀 Quick Start
 
 ### 🔧 Dataset Preparation
+
 To train ObjectGS, you should download the following dataset:
+
 * [3DOVS](https://github.com/Kunhao-Liu/3D-OVS)
 * [LERF-Mask](https://github.com/lkeab/gaussian-grouping/blob/main/docs/dataset.md#1-lerf-mask-dataset)
 * [Replica](https://github.com/facebookresearch/Replica-Dataset)
@@ -71,13 +72,16 @@ We organize the datasets as follows:
 │     ├── ...
 ```
 
-
 ### 🛠️ Installation
+
 1. Clone this repo:
+
 ```bash
 git clone git@github.com:RuijieZhu94/ObjectGS.git
 ```
+
 2. Install dependencies:
+
 ```bash
 cd ObjectGS
 conda env create --file environment.yml
@@ -108,8 +112,7 @@ bash train_3d.sh /path/to/your/dataset
 bash train_2d.sh /path/to/your/dataset
 ```
 
-
-### 🎇 Evaluation 
+### 🎇 Evaluation
 
 #### Rendering 2D Semantics
 
@@ -136,6 +139,7 @@ Specify `query_label_id` (0-255) to render single object. -1 means loop through 
 Please refer to [Gaussian-Grouping](https://github.com/lkeab/gaussian-grouping/blob/main/docs/dataset.md#2-render-mask-with-text-prompt) for OVS evaluation.
 
 #### Exporting Mesh
+
 ```shell
 # exporting scene mesh
 python export_mesh.py -m path/to/your/training/folder
@@ -159,5 +163,17 @@ If you find our work useful, please cite:
 ```
 
 ### 🤝 Acknowledgements
+
 Our code is based on [Scaffold-GS](https://city-super.github.io/scaffold-gs/), [HorizonGS](https://city-super.github.io/horizon-gs/), [GSplat](https://github.com/nerfstudio-project/gsplat) and [Gaussian-Grouping](https://github.com/lkeab/gaussian-grouping). We thank the authors for their excellent work!
 
+export http_proxy=http://127.0.0.1:7897
+export https_proxy=http://127.0.0.1:7897
+export all_proxy=socks5://127.0.0.1:7897  # 如果是 SOCKS5 代理
+
+python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name ramen
+
+python render_lerf_mask.py -m outputs/lerf_mask/rebuttal/ramen/2026-08-28_14:32:58  --skip_train
+
+python eval_lerf_mask.py ramen --pred_path outputs/lerf_mask/rebuttal/ramen/2026-08-28_14:32:58/test/ours_30000_text/test_mask
+
+python metrics.py -m outputs/replica/objectgs/office_0/2026-09-08_15:43:36

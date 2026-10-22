@@ -46,7 +46,12 @@ class GaussianModel(BasicModel):
         self.offset_gradient_accum = torch.empty(0)
         self.offset_denom = torch.empty(0)
         self.max_radii2D = torch.empty(0)
-                
+
+        # ===== ADDED: anchor gradient accumulation buffers =====
+        self._anchor_grad_accum = torch.empty(0)   # shape [N, 3] (same as _anchor)
+        self._anchor_denom = torch.empty(0)        # shape [N, 1]
+        # =====================================================
+
         self.optimizer = None
         self.spatial_lr_scale = 0
         self.padding =  0.0
@@ -112,6 +117,7 @@ class GaussianModel(BasicModel):
         param_dict['color_mlp'] = self.mlp_color.state_dict()
         if self.appearance_dim > 0:
             param_dict['appearance'] = self.embedding_appearance.state_dict()
+        # ===== MODIFIED: 保存 anchor 累积缓冲 =====
         return (
             self._anchor,
             self._offset,
@@ -124,9 +130,12 @@ class GaussianModel(BasicModel):
             param_dict,
             self.spatial_lr_scale,
             self.max_radii2D,
+            self._anchor_grad_accum,
+            self._anchor_denom,
         )
     
     def restore(self, model_args, training_args):
+        # ===== MODIFIED: 增加 anchor 缓冲的解包 =====
         (self._anchor,
         self._offset,
         self._scaling,
@@ -139,7 +148,10 @@ class GaussianModel(BasicModel):
         self.offset_gradient_accum,
         self.offset_denom,
         param_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale,
+        self._anchor_grad_accum,
+        self._anchor_denom) = model_args
+        # ==========================================
         self.training_setup(training_args)
         self.optimizer.load_state_dict(param_dict['optimizer'])
         self.mlp_opacity.load_state_dict(param_dict['opacity_mlp'])
@@ -199,22 +211,12 @@ class GaussianModel(BasicModel):
         return self.mlp_feature_bank
 
     def voxelize_sample(self, points=None, label_ids=None, voxel_size=0.001):
-        # Normalize coordinates to grid units and convert to integer indices
         coords = torch.round(points / voxel_size).to(torch.int32)
-
-        # Combine coordinates and labels into a tensor for deduplication
         combined = torch.cat([coords, label_ids.unsqueeze(1)], dim=1)
-
-        # Perform deduplication to ensure uniqueness
         unique_combined = torch.unique(combined, dim=0)
-
-        # Extract voxelized coordinates and corresponding labels
         voxelized_coords = unique_combined[:, :3]
         voxelized_labels = unique_combined[:, 3].to(torch.int64)
-
-        # Restore voxel coordinates to the original units
         voxelized_points = voxelized_coords * voxel_size
-
         return voxelized_points, voxelized_labels
 
     def create_from_pcd(self, pcd, spatial_lr_scale, global_appearance, logger):
@@ -236,7 +238,7 @@ class GaussianModel(BasicModel):
         logger.info(f'Initial Voxel Number: {fused_point_cloud.shape[0]}')
         logger.info(f'Voxel Size: {self.voxel_size}')
 
-        dist2 = (knn(fused_point_cloud, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist2 = (knn(fused_point_cloud, 4)[:, 1:] ** 2).mean(dim=-1)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -250,20 +252,29 @@ class GaussianModel(BasicModel):
         self.label_ids = label_ids.view(-1, 1).cuda()
         self.id_encoder = OneHotEncoder(self.label_ids)
 
+        # ===== ADDED: 初始化 anchor 累积缓冲 =====
+        self._anchor_grad_accum = torch.zeros_like(self._anchor)   # [N, 3]
+        self._anchor_denom = torch.zeros(self._anchor.shape[0], 1, device="cuda")
+        # ========================================
+
         if global_appearance != "":
             loaded_iter = searchForMaxIteration(os.path.join(global_appearance, "point_cloud"))
             self.load_mlp_checkpoints(os.path.join(global_appearance, "point_cloud", "iteration_{:d}".format(loaded_iter)))
             self.freeze_mlp(self.embedding_appearance)
 
     def training_setup(self, training_args):
-        
         self.anchor_opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         self.offset_opacity_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros(self.get_anchor.shape[0]*self.n_offsets, dtype=torch.float, device="cuda")
-        
+
+        # ===== ADDED: 初始化 anchor 累积缓冲（此时 _anchor 已存在） =====
+        self._anchor_grad_accum = torch.zeros_like(self._anchor)   # [N, 3]
+        self._anchor_denom = torch.zeros(self._anchor.shape[0], 1, device="cuda")
+        # =============================================================
+
         l = [
             {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
             {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
@@ -308,7 +319,6 @@ class GaussianModel(BasicModel):
                                                         max_steps=training_args.appearance_lr_max_steps)
 
     def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "anchor":
                 lr = self.anchor_scheduler_args(iteration)
@@ -386,7 +396,6 @@ class GaussianModel(BasicModel):
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         
-        # anchor_feat
         anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_anchor_feat")]
         anchor_feat_names = sorted(anchor_feat_names, key = lambda x: int(x.split('_')[-1]))
         anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
@@ -406,6 +415,11 @@ class GaussianModel(BasicModel):
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(False))
         self.active_sh_degree = self.max_sh_degree
+
+        # ===== ADDED: 从 PLY 加载后初始化 anchor 累积缓冲 =====
+        self._anchor_grad_accum = torch.zeros_like(self._anchor)
+        self._anchor_denom = torch.zeros(self._anchor.shape[0], 1, device="cuda")
+        # ===================================================
     
     def prune_anchor(self, mask):
         valid_points_mask = ~mask
@@ -418,18 +432,43 @@ class GaussianModel(BasicModel):
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-    def anchor_growing(self, grads, opt, offset_mask, iteration):
+        self.label_ids = self.label_ids[valid_points_mask]
+        self.id_encoder = OneHotEncoder(self.label_ids)
+
+        # ===== ADDED: 同步删除 anchor 累积缓冲 =====
+        self._anchor_grad_accum = self._anchor_grad_accum[valid_points_mask]
+        self._anchor_denom = self._anchor_denom[valid_points_mask]
+        # ========================================
+
+        self._anchor_mask = torch.ones(self.get_anchor.shape[0], dtype=torch.bool, device="cuda")
+        
+        return mask
+
+    def anchor_growing(self, grads, opt, offset_mask, iteration, skip_grad_check=False):
         init_length = self.get_anchor.shape[0]*self.n_offsets
-        for i in range(self.update_depth):
-            # update threshold
-            cur_threshold = opt.densify_grad_threshold*((self.update_hierachy_factor//2)**i)
-            # mask from grad threshold
-            candidate_mask = (grads >= cur_threshold)
-            candidate_mask = torch.logical_and(candidate_mask, offset_mask)
+        
+        if iteration < 4000:
+            loop_depth = int(math.log2(self.update_hierachy_factor)) + 1
+        elif iteration < 15000:
+            loop_depth = 1
+        else:
+            loop_depth = 1
+        
+        for i in range(loop_depth):
+            cur_threshold = opt.densify_grad_threshold * ((self.update_hierachy_factor // 2) ** i)
             
-            # random pick
-            rand_mask = torch.rand_like(candidate_mask.float())>(0.5**(i+1))
-            rand_mask = rand_mask.cuda()
+            if skip_grad_check:
+                candidate_mask = offset_mask.clone()
+            else:
+                candidate_mask = (grads >= cur_threshold)
+                candidate_mask = torch.logical_and(candidate_mask, offset_mask)
+            
+            if skip_grad_check:
+                rand_mask = torch.rand_like(candidate_mask.float()) > 0.25
+                rand_mask = rand_mask.cuda()
+            else:
+                rand_mask = torch.rand_like(candidate_mask.float()) > (0.5 ** (i + 1))
+                rand_mask = rand_mask.cuda()
             candidate_mask = torch.logical_and(candidate_mask, rand_mask)
             
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
@@ -440,8 +479,8 @@ class GaussianModel(BasicModel):
                 candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
 
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
-            size_factor = self.update_init_factor // (self.update_hierachy_factor**i)
-            cur_size = self.voxel_size*size_factor
+            size_factor = self.update_init_factor // (self.update_hierachy_factor ** i)
+            cur_size = self.voxel_size * size_factor
             
             grid_coords = torch.round(self.get_anchor / cur_size - self.padding).int()
             selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
@@ -453,13 +492,13 @@ class GaussianModel(BasicModel):
             elif selected_grid_coords_unique.shape[0] > 0 and grid_coords.shape[0] > 0:
                 remove_duplicates = self.get_remove_duplicates(grid_coords, selected_grid_coords_unique)
                 remove_duplicates = ~remove_duplicates
-                candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size + self.padding * cur_size
+                candidate_anchor = selected_grid_coords_unique[remove_duplicates] * cur_size + self.padding * cur_size
             else:
                 candidate_anchor = torch.zeros([0, 3], dtype=torch.float, device='cuda')
                 remove_duplicates = torch.ones([0], dtype=torch.bool, device='cuda')
 
             if candidate_anchor.shape[0] > 0:
-                new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size # *0.05
+                new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda() * cur_size
                 new_scaling = torch.log(new_scaling)
                 new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
                 new_rotation[:,0] = 1.0
@@ -478,6 +517,7 @@ class GaussianModel(BasicModel):
                 temp_label_ids = self.label_ids.repeat([1, self.n_offsets]).view(-1, 1)[candidate_mask]
                 temp_label_ids = scatter_max(temp_label_ids, inverse_indices.unsqueeze(1), dim=0)[0][remove_duplicates]
                 self.label_ids = torch.cat([self.label_ids, temp_label_ids], dim=0)
+                self.id_encoder = OneHotEncoder(self.label_ids)
 
                 temp_anchor_demon = torch.cat([self.anchor_demon, torch.zeros([candidate_anchor.shape[0], 1], device='cuda').float()], dim=0)
                 del self.anchor_demon
@@ -495,8 +535,15 @@ class GaussianModel(BasicModel):
                 self._rotation = optimizable_tensors["rotation"]
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._offset = optimizable_tensors["offset"]
-    
-    def save_mlp_checkpoints(self, path):#split or unite
+
+                # ===== ADDED: 为新锚点扩展 anchor 累积缓冲 =====
+                new_grad_accum = torch.zeros(candidate_anchor.shape[0], 3, device='cuda')
+                new_denom = torch.zeros(candidate_anchor.shape[0], 1, device='cuda')
+                self._anchor_grad_accum = torch.cat([self._anchor_grad_accum, new_grad_accum], dim=0)
+                self._anchor_denom = torch.cat([self._anchor_denom, new_denom], dim=0)
+                # ==============================================
+
+    def save_mlp_checkpoints(self, path):
         mkdir_p(os.path.dirname(path))
         self.eval()
         opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim+self.view_dim).cuda()))
@@ -509,21 +556,6 @@ class GaussianModel(BasicModel):
             emd = torch.jit.trace(self.embedding_appearance, (torch.zeros((1,), dtype=torch.long).cuda()))
             emd.save(os.path.join(path, 'embedding_appearance.pt'))
         self.train()
-
-    def prune_anchor(self, mask):
-        valid_points_mask = ~mask
-        optimizable_tensors = self._prune_anchor_optimizer(valid_points_mask)
-
-        self._anchor = optimizable_tensors["anchor"]
-        self._offset = optimizable_tensors["offset"]
-        self._anchor_feat = optimizable_tensors["anchor_feat"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
-
-        self.label_ids = self.label_ids[valid_points_mask]
-
-        return mask
-
 
     def load_mlp_checkpoints(self, path):
         self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
@@ -548,7 +580,6 @@ class GaussianModel(BasicModel):
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         
-        # anchor_feat
         anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_anchor_feat")]
         anchor_feat_names = sorted(anchor_feat_names, key = lambda x: int(x.split('_')[-1]))
         anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
@@ -561,13 +592,11 @@ class GaussianModel(BasicModel):
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         offsets = offsets.reshape((offsets.shape[0], 3, -1))
 
-        # label_ids
         label_ids = np.asarray(plydata.elements[0]["label"])[..., np.newaxis].astype(np.uint8)
 
         return anchor, anchor_feats, scales, rots, offsets, label_ids
 
     def create_from_pretrained(self, pcd, model_path, spatial_lr_scale, *args):
-        # we concat two domains of data, and then finetune to delete floaters
         self.spatial_lr_scale = spatial_lr_scale
         self.training_stage = "fine"
         self.load_config(model_path)
@@ -597,6 +626,11 @@ class GaussianModel(BasicModel):
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(False))
 
+        # ===== ADDED: 预训练加载时初始化 anchor 累积缓冲 =====
+        self._anchor_grad_accum = torch.zeros_like(self._anchor)
+        self._anchor_denom = torch.zeros(self._anchor.shape[0], 1, device="cuda")
+        # ====================================================
+
     def roll_back(self):
         self._anchor[:self.base_gs_num, :] = self.base_anchor
         self._anchor_feat[:self.base_gs_num, :] = self.base_anchor_feat
@@ -608,8 +642,6 @@ class GaussianModel(BasicModel):
     
         def construct_list_of_attributes():
             l = ['x', 'y', 'z']
-            
-            # All channels except the 3 DC
             for i in range(3):
                 l.append('f_dc_{}'.format(i))
             for i in range(3 * (self.max_sh_degree + 1) ** 2 - 3):
@@ -626,18 +658,13 @@ class GaussianModel(BasicModel):
         grid_offsets = self.get_offset
         grid_scaling = self.get_scaling
 
-        # get offset's opacity
-        neural_opacity = self.get_opacity_mlp(feat) # [N, k]
-
-        # opacity mask generation
+        neural_opacity = self.get_opacity_mlp(feat)
         neural_opacity = neural_opacity.reshape([-1, 1])
         mask = (neural_opacity>0.0)
         mask = mask.view(-1)
 
-        # select opacity 
         opacity = neural_opacity[mask]
 
-        # get offset's color
         if self.appearance_dim > 0:
             camera_indicies = torch.zeros_like(feat[:,0], dtype=torch.long, device=feat.device)
             appearance = self.get_appearance(camera_indicies)
@@ -646,19 +673,16 @@ class GaussianModel(BasicModel):
             color = self.get_color_mlp(feat)
 
         if self.color_attr == "RGB": 
-            color = color.reshape([anchor.shape[0]*self.n_offsets, 3])# [mask]
+            color = color.reshape([anchor.shape[0]*self.n_offsets, 3])
         else:
-            color = color.reshape([anchor.shape[0]*self.n_offsets, -1])# [mask]
+            color = color.reshape([anchor.shape[0]*self.n_offsets, -1])
         color_dim = color.shape[1]
 
-        # get offset's cov
         scale_rot = self.get_cov_mlp(feat)
-        scale_rot = scale_rot.reshape([anchor.shape[0]*self.n_offsets, 7]) # [mask]
+        scale_rot = scale_rot.reshape([anchor.shape[0]*self.n_offsets, 7])
         
-        # offsets
-        offsets = grid_offsets.view([-1, 3]) # [mask]
+        offsets = grid_offsets.view([-1, 3])
         
-        # combine for parallel masking
         concatenated = torch.cat([grid_scaling, anchor], dim=-1)
         concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=self.n_offsets)
         concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
@@ -666,22 +690,18 @@ class GaussianModel(BasicModel):
         
         scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, color_dim, 7, 3], dim=-1)
         
-        # post-process cov
-        scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
+        scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3])
         rot = self.rotation_activation(scale_rot[:,3:7])
         
-        # post-process color
-        color = color.view([color.shape[0], -1, 3])
-        features_dc = color[:, 0:1, :]
-        features_rest = color[:, 1:, :]
-
-        # post-process offsets to get centers for gaussians
         offsets = offsets * scaling_repeat[:,:3]
         xyz = repeat_anchor + offsets 
-        
+
+        if self.color_attr != "RGB": 
+            color = color.reshape([color.shape[0], self.color_dim // 3, 3])
+
         xyz = xyz.detach().cpu().numpy()
-        f_dc = features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_dc = color[:, 0:1, :].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = color[:, 1:, :].detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = opacity.detach().cpu().numpy()
         scale = scaling.detach().cpu().numpy()
         rotation = rot.detach().cpu().numpy()
@@ -713,20 +733,19 @@ class GaussianModel(BasicModel):
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
         scales = np.zeros((xyz.shape[0], len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
-            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            scales[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
 
         rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
         rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
-            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            rots[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
@@ -736,3 +755,113 @@ class GaussianModel(BasicModel):
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
+
+    # ========== run_densify (修改：增加 anchor 累积缓冲清零) ==========
+    def run_densify(self, opt, iteration, ext_split_mask=None, ext_prune_mask=None):
+        if opt.growing_type=="mean":
+            grads = self.offset_gradient_accum / self.offset_denom
+            grads[grads.isnan()] = 0.0
+            grads_norm = torch.norm(grads, dim=-1)
+            offset_mask = (self.offset_denom > opt.update_interval * opt.success_threshold * 0.5).squeeze(dim=1)
+        elif opt.growing_type=="max":
+            grads = self.offset_gradient_accum
+            grads[grads.isnan()] = 0.0
+            
+            opacities = self.offset_opacity_accum/self.offset_denom
+            opacities[opacities.isnan()] = 0.0
+            opacities = opacities.flatten()
+
+            grads_norm = torch.norm(grads, dim=-1) * self.max_radii2D * torch.pow(opacities, 1/5.0)
+            offset_mask = (self.offset_denom > opt.update_interval * opt.success_threshold * 0.5).squeeze(dim=1)
+            offset_mask = torch.logical_and(offset_mask, opacities > 0.15)
+        else:
+            raise ValueError(f"Unknown growing_type: {opt.growing_type}")
+
+        if ext_split_mask is not None:
+            ext_split_mask_prim = ext_split_mask.unsqueeze(1).repeat(1, self.n_offsets).view(-1)
+            offset_mask = ext_split_mask_prim
+            skip_grad = True
+            active_mask = ext_split_mask_prim.clone()
+        else:
+            skip_grad = False
+            active_mask = offset_mask.clone()
+
+        self.anchor_growing(grads_norm, opt, offset_mask, iteration, skip_grad_check=skip_grad)
+        
+        self.offset_denom[active_mask] = 0
+        padding_offset_demon = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
+                                           dtype=self.offset_denom.dtype, 
+                                           device=self.offset_denom.device)
+        self.offset_denom = torch.cat([self.offset_denom, padding_offset_demon], dim=0)
+
+        self.offset_gradient_accum[active_mask] = 0
+        padding_offset_gradient_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_gradient_accum.shape[0], 1],
+                                           dtype=self.offset_gradient_accum.dtype, 
+                                           device=self.offset_gradient_accum.device)
+        self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
+        
+        self.offset_opacity_accum[active_mask] = 0
+        padding_offset_opacity_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_opacity_accum.shape[0], 1],
+                                           dtype=self.offset_opacity_accum.dtype, 
+                                           device=self.offset_opacity_accum.device)
+        self.offset_opacity_accum = torch.cat([self.offset_opacity_accum, padding_offset_opacity_accum], dim=0)
+        
+        # align ext_prune_mask after growing
+        if ext_prune_mask is not None:
+            current_N = self.get_anchor.shape[0]
+            if ext_prune_mask.shape[0] < current_N:
+                padded = torch.zeros(current_N, dtype=torch.bool, device=ext_prune_mask.device)
+                padded[:ext_prune_mask.shape[0]] = ext_prune_mask
+                ext_prune_mask = padded
+            elif ext_prune_mask.shape[0] > current_N:
+                ext_prune_mask = ext_prune_mask[:current_N]
+
+        if ext_prune_mask is not None:
+            opacity_prune = (self.anchor_opacity_accum < opt.min_opacity * self.anchor_demon).squeeze(dim=1)
+            prune_mask = torch.logical_or(ext_prune_mask, opacity_prune)
+            anchors_mask = torch.ones(self.get_anchor.shape[0], dtype=torch.bool, device='cuda')
+        else:
+            anchors_mask = (self.anchor_demon > opt.update_interval * opt.success_threshold).squeeze(dim=1)
+            if opt.pruning_type=="mean":
+                prune_mask = (self.anchor_opacity_accum < opt.min_opacity*self.anchor_demon).squeeze(dim=1)
+            elif opt.pruning_type=="max":
+                prune_mask = (self.anchor_opacity_accum < opt.min_opacity).squeeze(dim=1)
+            else:
+                raise ValueError(f"Unknown pruning_type: {opt.pruning_type}")
+            prune_mask = torch.logical_and(prune_mask, anchors_mask)
+
+        prune_mask = self.prune_anchor(prune_mask)
+                
+        offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
+        offset_denom = offset_denom.view([-1, 1])
+        del self.offset_denom
+        self.offset_denom = offset_denom
+
+        offset_gradient_accum = self.offset_gradient_accum.view([-1, self.n_offsets])[~prune_mask]
+        offset_gradient_accum = offset_gradient_accum.view([-1, 1])
+        del self.offset_gradient_accum
+        self.offset_gradient_accum = offset_gradient_accum
+        
+        offset_opacity_accum = self.offset_opacity_accum.view([-1, self.n_offsets])[~prune_mask]
+        offset_opacity_accum = offset_opacity_accum.view([-1, 1])
+        del self.offset_opacity_accum
+        self.offset_opacity_accum = offset_opacity_accum
+        
+        if anchors_mask.sum()>0:
+            self.anchor_opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+            self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+        
+        temp_opacity_accum = self.anchor_opacity_accum[~prune_mask]
+        del self.anchor_opacity_accum
+        self.anchor_opacity_accum = temp_opacity_accum
+
+        temp_anchor_demon = self.anchor_demon[~prune_mask]
+        del self.anchor_demon
+        self.anchor_demon = temp_anchor_demon
+        
+        self.max_radii2D = torch.zeros(self.get_anchor.shape[0]*self.n_offsets, dtype=torch.float, device="cuda")
+
+        # ===== ADDED: 清零 anchor 累积缓冲（决策窗口结束） =====
+        self._anchor_grad_accum.zero_()
+        self._anchor_denom.zero_()
+        # ===================================================

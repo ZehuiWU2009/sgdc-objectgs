@@ -1,3 +1,6 @@
 [submodule "gsplat"]
 	path = gsplat
 	url = https://github.com/RuijieZhu94/gsplat-object
+[submodule "gsplat-object"]
+	path = gsplat-object
+	url = https://github.com/RuijieZhu94/gsplat-object.git

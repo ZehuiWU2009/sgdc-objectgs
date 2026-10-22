@@ -94,7 +94,6 @@ class BasicModel:
 
         return optimizable_tensors
 
-    # statis grad information to guide liftting. 
     def training_statis(self, opt, render_pkg, width, height):
         offset_selection_mask = render_pkg["selection_mask"]
         anchor_visible_mask = render_pkg["visible_mask"]
@@ -103,7 +102,6 @@ class BasicModel:
         opacity = render_pkg["opacity"]
         radii = render_pkg["radii"]
         
-        # update opacity stats
         temp_opacity = torch.zeros(offset_selection_mask.shape[0], dtype=torch.float32, device="cuda")
         temp_opacity[offset_selection_mask] = opacity.clone().view(-1).detach()
         
@@ -113,24 +111,22 @@ class BasicModel:
             sum_of_elements = temp_opacity.sum(dim=1, keepdim=True).cuda()
             count_of_elements = temp_mask.sum(dim=1, keepdim=True).float().cuda()
             average = sum_of_elements / torch.clamp(count_of_elements, min=1.0)
-            average[count_of_elements == 0] = 0 # avoid nan
+            average[count_of_elements == 0] = 0
             self.anchor_opacity_accum[anchor_visible_mask] += average
         elif opt.pruning_type=="max":
             self.anchor_opacity_accum[anchor_visible_mask] = torch.max(self.anchor_opacity_accum[anchor_visible_mask], torch.abs(temp_opacity.sum(dim=1, keepdim=True)))
         else:
             raise ValueError(f"Unknown pruning_type: {opt.pruning_type}")
         
-        # update anchor visiting statis
         self.anchor_demon[anchor_visible_mask] += 1
 
-        # update neural gaussian statis
         anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
         combined_mask = torch.zeros_like(self.offset_gradient_accum, dtype=torch.bool).squeeze(dim=1)
         combined_mask[anchor_visible_mask] = offset_selection_mask
         temp_mask = combined_mask.clone()
         combined_mask[temp_mask] = update_filter
         
-        grad = viewspace_point_tensor.grad.squeeze(0) # [N, 2]
+        grad = viewspace_point_tensor.grad.squeeze(0)
         grad[:, 0] *= width * 0.5
         grad[:, 1] *= height * 0.5
         grad_norm = torch.norm(grad[update_filter,:2], dim=-1, keepdim=True)
@@ -211,20 +207,27 @@ class BasicModel:
         
         return int_level
 
-    def run_densify(self, opt, iteration):
-        # adding anchors
+    # ========== MODIFIED: run_densify with SADC full control ==========
+    def run_densify(self, opt, iteration, ext_split_mask=None, ext_prune_mask=None):
+        # ===== ADDED: 15000轮后强制清空 SADC mask，彻底走原生 =====
+        anneal_end = getattr(opt, 'anneal_end_iter', 15000)
+        if iteration > anneal_end:
+            ext_split_mask = None
+            ext_prune_mask = None
+        # =========================================================
+        
         if opt.growing_type=="mean":
-            grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
+            grads = self.offset_gradient_accum / self.offset_denom
             grads[grads.isnan()] = 0.0
             grads_norm = torch.norm(grads, dim=-1)
             offset_mask = (self.offset_denom > opt.update_interval * opt.success_threshold * 0.5).squeeze(dim=1)
         elif opt.growing_type=="max":
-            grads = self.offset_gradient_accum # [N*k, 1]
+            grads = self.offset_gradient_accum
             grads[grads.isnan()] = 0.0
             
             opacities = self.offset_opacity_accum/self.offset_denom
             opacities[opacities.isnan()] = 0.0
-            opacities = opacities.flatten() # [N*k]
+            opacities = opacities.flatten()
 
             grads_norm = torch.norm(grads, dim=-1) * self.max_radii2D * torch.pow(opacities, 1/5.0)
             offset_mask = (self.offset_denom > opt.update_interval * opt.success_threshold * 0.5).squeeze(dim=1)
@@ -232,40 +235,85 @@ class BasicModel:
         else:
             raise ValueError(f"Unknown growing_type: {opt.growing_type}")
 
-        self.anchor_growing(grads_norm, opt, offset_mask, iteration)
+        # ========== FIX 问题1: SADC split 直接信任 SADC，移除 offset_denom 过滤 ==========
+        if ext_split_mask is not None:
+            ext_split_mask_prim = ext_split_mask.unsqueeze(1).repeat(1, self.n_offsets).view(-1)
+            # SADC 模式下：完全信任 SADC 的 split 决策
+            # SADC 在 semantic_density_control.py 中已通过梯度阈值过滤低质量点
+            offset_mask = ext_split_mask_prim
+            skip_grad = True
+            # FIX 1: SADC 模式下，重置所有 SADC 选中的 primitive 的统计量
+            active_mask = ext_split_mask_prim.clone()
+        else:
+            skip_grad = False
+            # 原生模式：保持原逻辑
+            active_mask = offset_mask.clone()
+        # ================================================================================
+
+        self.anchor_growing(grads_norm, opt, offset_mask, iteration, skip_grad_check=skip_grad)
         
-        # update offset_denom
-        self.offset_denom[offset_mask] = 0
+        # ===== FIX 1: 用 active_mask 全量重置统计量 =====
+        self.offset_denom[active_mask] = 0
+        # =================================================
+        # ===== FIX 2: padding dtype 改为目标 tensor 的 dtype =====
         padding_offset_demon = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
-                                           dtype=torch.int32, 
+                                           dtype=self.offset_denom.dtype, 
                                            device=self.offset_denom.device)
+        # =====================================================
         self.offset_denom = torch.cat([self.offset_denom, padding_offset_demon], dim=0)
 
-        self.offset_gradient_accum[offset_mask] = 0
+        # ===== FIX 1: 用 active_mask 全量重置 =====
+        self.offset_gradient_accum[active_mask] = 0
+        # =========================================
+        # ===== FIX 2: padding dtype 改为目标 tensor 的 dtype =====
         padding_offset_gradient_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_gradient_accum.shape[0], 1],
-                                           dtype=torch.int32, 
+                                           dtype=self.offset_gradient_accum.dtype, 
                                            device=self.offset_gradient_accum.device)
+        # =====================================================
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
         
-        self.offset_opacity_accum[offset_mask] = 0
+        # ===== FIX 1: 用 active_mask 全量重置 =====
+        self.offset_opacity_accum[active_mask] = 0
+        # =========================================
+        # ===== FIX 2: padding dtype 改为目标 tensor 的 dtype =====
         padding_offset_opacity_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_opacity_accum.shape[0], 1],
-                                           dtype=torch.int32, 
+                                           dtype=self.offset_opacity_accum.dtype, 
                                            device=self.offset_opacity_accum.device)
+        # =====================================================
         self.offset_opacity_accum = torch.cat([self.offset_opacity_accum, padding_offset_opacity_accum], dim=0)
         
-        # prune anchors
-        if opt.pruning_type=="mean":
-            prune_mask = (self.anchor_opacity_accum < opt.min_opacity*self.anchor_demon).squeeze(dim=1)
-        elif opt.pruning_type=="max":
-            prune_mask = (self.anchor_opacity_accum < opt.min_opacity).squeeze(dim=1)
+        # align ext_prune_mask after growing
+        if ext_prune_mask is not None:
+            current_N = self.get_anchor.shape[0]
+            if ext_prune_mask.shape[0] < current_N:
+                padded = torch.zeros(current_N, dtype=torch.bool, device=ext_prune_mask.device)
+                padded[:ext_prune_mask.shape[0]] = ext_prune_mask
+                ext_prune_mask = padded
+            elif ext_prune_mask.shape[0] > current_N:
+                ext_prune_mask = ext_prune_mask[:current_N]
+
+        # ========== FIX 问题2: SADC prune 直接信任 SADC，移除 anchor_demon 过滤 ==========
+        if ext_prune_mask is not None:
+            # SADC 模式下：完全信任 SADC 的 prune 决策
+            # 原生 opacity 兜底仍然保留（低 opacity 点始终可被剪）
+            opacity_prune = (self.anchor_opacity_accum < opt.min_opacity * self.anchor_demon).squeeze(dim=1)
+            prune_mask = torch.logical_or(ext_prune_mask, opacity_prune)
+            # 不再用 anchors_mask 限制 SADC 的剪枝决策
+            anchors_mask = torch.ones(self.get_anchor.shape[0], dtype=torch.bool, device='cuda')
         else:
-            raise ValueError(f"Unknown pruning_type: {opt.pruning_type}")
-        
-        anchors_mask = (self.anchor_demon > opt.update_interval * opt.success_threshold).squeeze(dim=1) # [N, 1]
-        prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+            # 原生模式：恢复原有逻辑
+            anchors_mask = (self.anchor_demon > opt.update_interval * opt.success_threshold).squeeze(dim=1)
+            if opt.pruning_type=="mean":
+                prune_mask = (self.anchor_opacity_accum < opt.min_opacity*self.anchor_demon).squeeze(dim=1)
+            elif opt.pruning_type=="max":
+                prune_mask = (self.anchor_opacity_accum < opt.min_opacity).squeeze(dim=1)
+            else:
+                raise ValueError(f"Unknown pruning_type: {opt.pruning_type}")
+            prune_mask = torch.logical_and(prune_mask, anchors_mask)
+        # ===================================================================================
+
         prune_mask = self.prune_anchor(prune_mask)
                 
-        # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
         offset_denom = offset_denom.view([-1, 1])
         del self.offset_denom
@@ -281,7 +329,6 @@ class BasicModel:
         del self.offset_opacity_accum
         self.offset_opacity_accum = offset_opacity_accum
         
-        # update opacity accum 
         if anchors_mask.sum()>0:
             self.anchor_opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
             self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
@@ -295,9 +342,9 @@ class BasicModel:
         self.anchor_demon = temp_anchor_demon
         
         self.max_radii2D = torch.zeros(self.get_anchor.shape[0]*self.n_offsets, dtype=torch.float, device="cuda")
+    # =================================================================
 
     def generate_neural_gaussians(self, viewpoint_camera, visible_mask=None, training=True):
-        ## view frustum filtering for acceleration    
         if visible_mask is None:
             visible_mask = torch.ones(self.get_anchor.shape[0], dtype=torch.bool, device = self.get_anchor.device)
 
@@ -307,26 +354,16 @@ class BasicModel:
         grid_scaling = self.get_scaling[visible_mask]
         semantics = self.get_semantic[visible_mask]
 
-        ## get view properties for anchor
         ob_view = anchor - viewpoint_camera.camera_center
-        # dist
         ob_dist = ob_view.norm(dim=1, keepdim=True)
-        # view
         ob_view = ob_view / ob_dist
         
         if self.view_dim > 0:
-            cat_local_view = torch.cat([feat, ob_view], dim=1) # [N, c+3]
+            cat_local_view = torch.cat([feat, ob_view], dim=1)
         else:
-            cat_local_view = feat # [N, c]
+            cat_local_view = feat
 
         if self.appearance_dim > 0:
-            # if self.ape_code < 0:
-            #     camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
-            #     appearance = self.get_appearance(camera_indicies)
-            # else:
-            #     # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * self.ape_code
-            #     camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 0
-            #     appearance = self.get_appearance(camera_indicies)
             if training:
                 camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
                 appearance = self.get_appearance(camera_indicies)
@@ -334,47 +371,48 @@ class BasicModel:
                 camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 0
                 appearance = self.get_appearance(camera_indicies)
                 
-        # get offset's opacity
         neural_opacity = self.get_opacity_mlp(cat_local_view) * self.smooth_complement(visible_mask)
-
-        # opacity mask generation
         neural_opacity = neural_opacity.reshape([-1, 1])
         mask = (neural_opacity>0.0)
         mask = mask.view(-1)
 
-        # select opacity 
         opacity = neural_opacity[mask]
 
-        # get offset's color
         if self.appearance_dim > 0:
             color = self.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
         else:
             color = self.get_color_mlp(cat_local_view)
 
-        color = color.reshape([anchor.shape[0]*self.n_offsets, self.color_dim])# [mask]
+        color = color.reshape([anchor.shape[0]*self.n_offsets, self.color_dim])
 
-        # get object number
         object_num = semantics.shape[-1]
 
-        # get offset's cov
         scale_rot = self.get_cov_mlp(cat_local_view)
-        scale_rot = scale_rot.reshape([anchor.shape[0]*self.n_offsets, 7]) # [mask]
+        scale_rot = scale_rot.reshape([anchor.shape[0]*self.n_offsets, 7])
         
-        # offsets
-        offsets = grid_offsets.view([-1, 3]) # [mask]
+        offsets = grid_offsets.view([-1, 3])
         
-        # combine for parallel masking
         concatenated = torch.cat([grid_scaling, anchor, semantics], dim=-1)
         concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=self.n_offsets)
         concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
-        masked = concatenated_all[mask]
+        _mask_idx = torch.nonzero(mask, as_tuple=True)[0]
+        
+        # ===== ADDED: 防御性边界检查，防止高斯数膨胀时的索引越界 =====
+        if _mask_idx.numel() > 0:
+            valid_mask = _mask_idx < concatenated_all.shape[0]
+            if not valid_mask.all():
+                num_invalid = (~valid_mask).sum().item()
+                print(f"[WARN] generate_neural_gaussians: {num_invalid}/{_mask_idx.numel()} indices out of bounds "
+                      f"(max_idx={_mask_idx.max().item()}, tensor_len={concatenated_all.shape[0]}), clamping")
+                _mask_idx = _mask_idx[valid_mask]
+        # =============================================================
+        
+        masked = concatenated_all[_mask_idx]
         scaling_repeat, repeat_anchor, semantics, color, scale_rot, offsets = masked.split([6, 3, object_num, self.color_dim, 7, 3], dim=-1)
         
-        # post-process cov
-        scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
+        scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3])
         rot = self.rotation_activation(scale_rot[:,3:7])
         
-        # post-process offsets to get centers for gaussians
         offsets = offsets * scaling_repeat[:,:3]
         xyz = repeat_anchor + offsets 
 
@@ -402,7 +440,7 @@ class BasicModel:
             lp, op, pp = parse_cfg(cfg)
         self.pretrained_config = lp.model_config
 
-    def save_mlp_checkpoints(self, path):#split or unite
+    def save_mlp_checkpoints(self, path):
         return
 
     def load_mlp_checkpoints(self, path):

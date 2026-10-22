@@ -23,7 +23,7 @@ model_params: {
     exp_name: object_0.01,
     images: images,
     depths: depths,
-    masks: masks,
+    masks: object_mask,
     resolution: 4,
     white_background: False,
     random_background: False,
@@ -103,5 +103,27 @@ optim_params: {
     extra_up: 0.050000,
     start_depth: 500,
     depth_l1_weight_init: 1.000000,
-    depth_l1_weight_final: 0.010000
+    depth_l1_weight_final: 0.010000,
+    
+    semantic_density_control_start: 4000,
+    semantic_density_interval: 500,
+
+    fixed_split_threshold: 0.000005,
+    split_quantile: 0.3,
+    prune_quantile: 0.04,
+    prune_abs_threshold: 0.0001,
+    min_points_per_instance: 2,
+
+    filter_low_confidence: 1,
+    confidence_threshold: 0.7,
+
+    anneal_enable: 1,
+    anneal_start_iter: 5000,
+    anneal_end_iter: 15000,
+    anneal_target_factor: 0.5,
+
+    ablation_instance_split: 1,
+    ablation_gradient_prune: 1,
+    bg_split_quantile: 0.95
+
 }
