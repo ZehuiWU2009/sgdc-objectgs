@@ -1,4 +1,4 @@
-
+# Official code for "Semantic-Guided Density Control for Compact Semantic 3D Gaussian Splatting" (Computers & Graphics), anchor-based instantiation on ObjectGS
 
 python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name ramen
 
