@@ -1,5 +1,9 @@
 # Semantic-Guided Density Control for Compact Semantic 3D Gaussian Splatting
 
+Anchor-based instantiation of SGDC, built on top of [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/). The primitive-based instantiation on Gaussian Grouping is available at [SGDC-GS](https://github.com/yuweidong/sgdc-gs).
+
+## Installation
+
 python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name ramen
 
 python render_lerf_mask.py -m outputs/lerf_mask/rebuttal/ramen/2026-08-28_14:32:58  --skip_train
