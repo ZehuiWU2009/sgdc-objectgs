@@ -68,4 +68,4 @@ python metrics.py -m path/to/your/training/folder
 ``` 
 
 ## Acknowledgements
-This project is built upon [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting) and [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/) . We gratefully acknowledge the authors for open-sourcing their code and making this research possible.
+This project is built upon [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting), [Scaffold-GS](https://github.com/city-super/Scaffold-GS) and [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/) . We gratefully acknowledge the authors for open-sourcing their code and making this research possible.
