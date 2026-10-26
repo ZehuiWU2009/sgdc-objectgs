@@ -1,4 +1,4 @@
-name: objectgs
+name: sgdc_objectgs
 channels:
   - pytorch
   - nvidia
