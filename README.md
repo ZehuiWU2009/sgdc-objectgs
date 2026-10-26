@@ -36,11 +36,36 @@ pip install git+https://github.com/RuijieZhu94/gsplat-object.git
 
 ## Training and Evaluate
 
-
+### LERF-Mask
+#### Ramen scene
+```bash
 python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name ramen
+python render_lerf_mask.py -m path/to/your/training/folder  --skip_train
+python eval_lerf_mask.py ramen --pred_path path/to/your/training/folder
+python metrics.py -m path/to/your/training/folder
+```
 
-python render_lerf_mask.py -m outputs/lerf_mask/rebuttal/ramen/2026-08-28_14:32:58  --skip_train
+#### Figurines scene
+```bash
+python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name figurines
+python render_lerf_mask.py -m path/to/your/training/folder  --skip_train
+python eval_lerf_mask.py figurines --pred_path path/to/your/training/folder
+python metrics.py -m path/to/your/training/folder
+```
 
-python eval_lerf_mask.py ramen --pred_path outputs/lerf_mask/rebuttal/ramen/2026-08-28_14:32:58/test/ours_30000_text/test_mask
+#### Teatime scene
+```bash
+python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name teatime
+python render_lerf_mask.py -m path/to/your/training/folder  --skip_train
+python eval_lerf_mask.py teatime --pred_path path/to/your/training/folder
+python metrics.py -m path/to/your/training/folder
+```
 
-python metrics.py -m outputs/replica/objectgs/office_0/2026-09-08_15:43:36
+### Mip-NeRF 360
+```bash
+python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name counter
+python metrics.py -m path/to/your/training/folder
+``` 
+
+## Acknowledgements
+This project is built upon [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting) and [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/) . We gratefully acknowledge the authors for open-sourcing their code and making this research possible.
