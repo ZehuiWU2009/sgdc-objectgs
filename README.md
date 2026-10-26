@@ -16,6 +16,18 @@ cd sgdc-objectgs
 conda env create --file environment.yml
 ```
 
+3. Install customized gsplat:
+
+**❗️❗️❗️Attention: You should install the [customized gsplat](https://github.com/RuijieZhu94/gsplat-object), instead of the original gsplat.**
+
+If compilation fails, you will likely need to install `libglm-dev`:
+
+```bash
+sudo apt-get install libglm-dev
+# then reinstall gsplat-object
+pip install git+https://github.com/RuijieZhu94/gsplat-object.git
+```
+
 ## Preparing the data
 
 
