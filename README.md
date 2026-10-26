@@ -4,6 +4,24 @@ Anchor-based instantiation of SGDC, built on top of [ObjectGS](https://github.co
 
 ## Installation
 
+1. Clone the repository locally:
+
+```bash
+git clone https://github.com/ZehuiWU2009/sgdc-objectgs
+```
+
+2. Install dependencies:
+```bash
+cd sgdc-objectgs
+conda env create --file environment.yml
+```
+
+## Preparing the data
+
+
+## Training and Evaluate
+
+
 python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name ramen
 
 python render_lerf_mask.py -m outputs/lerf_mask/rebuttal/ramen/2026-08-28_14:32:58  --skip_train
