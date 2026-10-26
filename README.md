@@ -30,6 +30,9 @@ pip install git+https://github.com/RuijieZhu94/gsplat-object.git
 
 ## Preparing the data
 
+- **Download**: You can download the LERF-Masked dataset from this [link](https://huggingface.co/mqye/Gaussian-Grouping/tree/main/data/lerf_mask).
+
+- **Preprocessing**: Please refer to [PLY_PREPROCESSING_README.md](PLY_PREPROCESSING_README.md) for detailed usage.
 
 ## Training and Evaluate
 
