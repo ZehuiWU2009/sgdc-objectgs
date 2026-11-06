@@ -63,7 +63,7 @@ python metrics.py -m path/to/your/training/folder
 
 ### Mip-NeRF 360
 ```bash
-python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name counter
+python train.py --config config/objectgs/3d/mipnerf360/config.yaml --scene_name counter
 python metrics.py -m path/to/your/training/folder
 ``` 
 
