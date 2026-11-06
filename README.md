@@ -67,5 +67,107 @@ python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name c
 python metrics.py -m path/to/your/training/folder
 ``` 
 
+## Reproducing the reported experiments
+
+All runs take one config file plus a scene name. `train.py` exposes `--config`, `--scene_name`, `--gpu` and logging flags on the command line; values inside `optim_params` cannot be overridden from the shell. Every ablation and sensitivity run therefore starts from a copy of the config file with the relevant lines edited.
+
+The config file is copied into the output folder when training starts. Results are written to `outputs/<dataset_name>/<exp_name>/<scene_name>/<timestamp>`, and `train.py` renders and evaluates at the end of training. The `path/to/your/training/folder` placeholders above refer to this folder. For the numbers in the paper, use the config paths listed below. The Mip-NeRF 360 run in particular needs `config/objectgs/3d/mipnerf360/config.yaml`, whose SGDC thresholds differ from the LERF-Mask ones.
+
+Data setup: `ply_preprocessing.py` writes `points3D_corr.ply`. Place it as `sparse/0/points3D.ply` inside each LERF-Mask and Replica scene folder, and as `points3D.ply` inside the Mip-NeRF 360 scene folder, as expected by `scene/dataset_readers.py`.
+
+### Full SGDC configuration
+
+The full model is the unmodified default of each config file. The values below are read from the three files under `config/objectgs/3d/`. A value marked `*` is forwarded to the controller but has no effect in this anchor-based adapter, which reads hard `label_ids` instead of classifier probabilities.
+
+| Parameter | LERF-Mask | Mip-NeRF 360 | Replica |
+| --- | --- | --- | --- |
+| `dataset_name` | `lerf_mask` | `mipnerf360` | `replica` |
+| `source_path` | `datasets/lerf_mask` | `datasets/mipnerf360` | `datasets/replica` |
+| `exp_name` | `rebuttal` | `object_0.01` | `objectgs` |
+| `images` | `images` | `images` | `images_all` |
+| `resolution` | -1 | 4 | -1 |
+| `eval` | False | True | True |
+| `iterations` | 30,000 | 30,000 | 30,000 |
+| `lambda_object_loss` | 0.01 | 0.001 | 0.1 |
+| `densify_grad_threshold` | 5e-5 | 2e-4 | 2e-5 |
+| `start_stat` | 500 | 500 | 500 |
+| `update_from` | 1,500 | 1,500 | 1,500 |
+| `update_interval` | 100 | 100 | 100 |
+| `update_until` | 30,000 | 30,000 | 30,000 |
+| `min_opacity` | 0.005 | 0.005 | 0.005 |
+| `success_threshold` | 0.8 | 0.8 | 0.8 |
+| `semantic_density_control_start` | 4,000 | 4,000 | 4,000 |
+| `semantic_density_interval` | 500 | 500 | 500 |
+| `fixed_split_threshold` | 3e-5 | 5e-6 | 6e-7 |
+| `split_quantile` | 0.30 | 0.30 | 0.65 |
+| `bg_split_quantile` | 0.95 | 0.95 | 0.95 |
+| `prune_quantile` | 0.04 | 0.04 | 0.06 |
+| `prune_abs_threshold` | 6e-5 | 1e-4 | 3e-10 |
+| `min_points_per_instance` | 5 | 2 | 10 |
+| `filter_low_confidence` | 1* | 1* | 1* |
+| `confidence_threshold` | 0.7* | 0.7* | 0.7* |
+| `anneal_enable` | 1 | 1 | 1 |
+| `anneal_start_iter` | 5,000 | 5,000 | 5,000 |
+| `anneal_end_iter` | 15,000 | 15,000 | 15,000 |
+| `anneal_target_factor` | 0.5 | 0.5 | 0.5 |
+| `ablation_instance_split` | 1 | 1 | 1 |
+| `ablation_gradient_prune` | 1 | 1 | 1 |
+| `ablation_semantic` | 1, hard-coded in `train.py` | same | same |
+| `shuffle` in `pipeline_params` | True | True | True |
+
+Absolute gradient thresholds are calibrated per dataset because anchor gradient magnitudes differ by orders of magnitude. The relative quantiles and the annealing schedule are shared. The controller runs from iteration 4,000, every 500 iterations, until iteration 15,000; after that only the opacity pruning path is active.
+
+### Commands for the three scene groups
+
+```bash
+# LERF-Mask: three scenes, identical config and parameters
+python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name ramen
+python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name figurines
+python train.py --config config/objectgs/3d/lerf_mask/config.yaml --scene_name teatime
+
+# Mip-NeRF 360: counter, reported in Table 5
+python train.py --config config/objectgs/3d/mipnerf360/config.yaml --scene_name counter
+
+# Replica: office_0, reported in Table 6
+python train.py --config config/objectgs/3d/replica/config.yaml --scene_name office_0
+```
+
+For Replica, `--scene_name` must match the folder name of your scene; the paper reports `office_0`. `train_3d.sh <scene_dir>` iterates over every scene folder and selects the config from the parent folder name. Each run writes to `outputs/lerf_mask/rebuttal/<scene>/<timestamp>`, `outputs/mipnerf360/object_0.01/<scene>/<timestamp>` or `outputs/replica/objectgs/<scene>/<timestamp>`.
+
+### Ablations
+
+Use the `figurines` scene so that the setup matches the ablation scene in the paper. The component tables there were produced with the Gaussian Grouping backbone in the companion `sgdc-gs` repository. The runs below apply the same switches to the anchor-based backbone and are not expected to reproduce those exact numbers.
+
+| Variant | Change relative to a copy of `lerf_mask/config.yaml` |
+| --- | --- |
+| Full | No change |
+| w/o Adaptive | `ablation_instance_split: 0` and `anneal_enable: 0` |
+| w/o Prune | `ablation_gradient_prune: 0` |
+| w/o Annealing | `anneal_enable: 0` |
+| w/o Semantic | Not available from the config: `ablation_semantic` is hard-coded to 1 at the controller construction in `train.py`. Set it to 0 there. |
+
+Do not change `anneal_end_iter` to build an annealing ablation. `train.py` also uses `iteration < opt.anneal_end_iter` as the end of the whole SGDC window, so editing that value silently shortens or extends density control. Use `anneal_enable: 0` instead.
+
+The sensitivity sweeps in the paper use a confidence threshold of 0.3, 0.6 or 0.9 and a pruning quantile of 0.04, 0.06 or 0.08. `prune_quantile` is effective here. `confidence_threshold` is not, because this adapter uses hard labels, so the confidence sweep belongs to the `sgdc-gs` repository.
+
+```bash
+mkdir -p config/objectgs/3d/ablation
+cp config/objectgs/3d/lerf_mask/config.yaml config/objectgs/3d/ablation/lerf_mask_wo_adaptive.yaml
+python - <<'PY'
+p = "config/objectgs/3d/ablation/lerf_mask_wo_adaptive.yaml"
+s = open(p).read()
+s = s.replace("ablation_instance_split: 1", "ablation_instance_split: 0")
+s = s.replace("anneal_enable: 1", "anneal_enable: 0")
+open(p, "w").write(s)
+PY
+python train.py --config config/objectgs/3d/ablation/lerf_mask_wo_adaptive.yaml --scene_name figurines
+```
+
+### Random seed and reproducibility
+
+All reported runs use seed 0: the full model, every ablation and all three scene groups. `train.py` calls `safe_state()` before training, which sets `random.seed(0)`, `np.random.seed(0)` and `torch.manual_seed(0)` in `utils/general_utils.py`. Camera sampling with `randint` in the training loop and `shuffle: True` in `pipeline_params` are both driven by this seed. There is no `--seed` flag; to run another seed, edit those three lines in `safe_state()` and keep a separate config copy for each run.
+
+`vis_ply.py` uses a separate default seed of 42 for its offline color map, and `train.py` carries an unused copy of that class. Neither is instantiated during training, so the training seed remains 0. `ply_preprocessing.py` maps IDs to colors deterministically and uses no seed. Pass `--gpu 0` explicitly on multi-GPU machines, since the `nvidia-smi` query at the top of `train.py` otherwise picks the least-used device. CUDA atomic operations are not bit-deterministic, so keep the GPU model, driver and `environment.yml` fixed and expect small numerical differences across devices. Every run stores `config.yaml`, `outputs.log` and `train_stats.json` in its output folder; archive them together with the checkpoint.
+
 ## Acknowledgements
 This project is built upon [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting), [Scaffold-GS](https://github.com/city-super/Scaffold-GS) and [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/) . We gratefully acknowledge the authors for open-sourcing their code and making this research possible.
