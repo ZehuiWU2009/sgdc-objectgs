@@ -2,6 +2,57 @@
 
 Anchor-based instantiation of SGDC, built on top of [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/). The primitive-based instantiation on Gaussian Grouping is available at [sgdc-gs](https://github.com/yuweidong/sgdc-gs).
 
+## Technical roadmap
+
+SGDC is a density-control hook inside the training loop, not a new network and not a change to the rasterizer. Between iteration 4,000 and 15,000 it runs every 500 iterations. Each pass reads two quantities for every representation unit: the semantic confidence `c_i` and the accumulated gradient. It then applies three decisions in a fixed order and returns the updated unit set `U'` to the next iteration. A unit is an anchor in this repository and an individual Gaussian in the companion primitive-based repository. All three decisions consume the same confidence and gradient, so the diagram below is one pass of a single controller rather than three independent algorithms.
+
+```mermaid
+flowchart TD
+    A["Representation units U with identity labels<br/>multi-view images and SAM 2D masks"] --> B["Render RGB and semantic outputs from U"]
+    B --> C["Total loss: L_rec + λ2d L_2d + λ3d L_3d"]
+    C --> D["Backpropagate to per-unit accumulated gradient"]
+    D --> E{"SGDC hook this iteration?<br/>t between 4,000 and 15,000, every 500 steps"}
+    E -->|No| Z["Return updated unit set<br/>enter next iteration"]
+    E -->|Yes| F["Read semantic confidence c_i<br/>anchor label_ids here, softmax in sgdc-gs"]
+    F --> G{"c_i above tau_c?"}
+    G -->|Yes| H["Reliable groups<br/>keep predicted label y_i"]
+    G -->|No| I["Uncertain set<br/>assign label -1"]
+    H --> J["Group units by semantic label"]
+    I --> J
+    J --> K["Annealed split threshold<br/>linear decay to 0.5 across 5,000-15,000"]
+    K --> L["Per-group split quantile<br/>q_fg for reliable, q_bg for uncertain"]
+    L --> M{"gradient above group quantile?"}
+    M -->|Yes| N["Split or grow unit<br/>add anchors here, add Gaussians in sgdc-gs"]
+    M -->|No| O["Keep unit"]
+    N --> P["Per-group pruning quantile Q_prune"]
+    O --> P
+    P --> Q{"below Q_prune AND below tau_prune_abs?"}
+    Q -->|Yes| R["Remove unit<br/>and its decoded neural Gaussians"]
+    Q -->|No| S["Keep unit"]
+    R --> T["Retain vanilla 3DGS rules<br/>low opacity or oversized screen footprint"]
+    S --> T
+    T --> Z
+    Z -.-> A
+```
+
+Three stages, in the order they execute:
+
+1. **Confidence-guided semantic labelling** (Eq. 5). Units whose confidence reaches `tau_c` keep their predicted label and form the reliable groups. The rest are assigned label `-1` and collected into one uncertain set. This keeps semantic bleeding out of densification: uncertain boundary and background units no longer compete with reliable semantic groups for the same splitting budget.
+
+2. **Semantic adaptive splitting with annealing** (Eq. 7). For each group the controller computes a gradient quantile, using `q_fg` for reliable groups and `q_bg` for the uncertain set. A unit grows when its gradient exceeds that group's quantile, under an effective threshold that decays linearly to half its initial value between iterations 5,000 and 15,000. Early iterations therefore build coarse structure and later iterations add fine detail.
+
+3. **Gradient-aware pruning** (Eq. 8). A unit is removed only when its gradient is both below its group's pruning quantile `Q_prune` and below the absolute bound `tau_prune_abs`. The quantile locates redundant units within a group, while the absolute bound protects flat regions such as walls and sky from being emptied. The original 3DGS rules, low opacity and oversized screen-space footprint, are retained on top.
+
+| Stage | Paper | Where it lives in this repository |
+| --- | --- | --- |
+| Labelling | Eq. 5 | `compute_semantic_labels` in `semantic_density_control.py` reads hard `label_ids`; background 0 becomes label `-1` |
+| Splitting and annealing | Eq. 7 | `_get_current_split_threshold` plus the split branch of `compute_split_prune_masks` |
+| Pruning | Eq. 8 | `inst_prune` in `compute_split_prune_masks` combines the group quantile with `prune_abs_threshold` |
+| Hook scheduling | Algorithm 1 | `train.py` injects both masks into `run_densify` through `ext_split_mask` and `ext_prune_mask`; after iteration 15,000 only the opacity path runs |
+
+Threshold values differ across the three datasets and between the two backbones, so the diagram uses symbols rather than numbers. The values this repository actually uses are listed in [Full SGDC configuration](#full-sgdc-configuration). Relative quantiles and the annealing schedule are shared, while absolute gradient bounds are recalibrated per dataset. On LERF-Mask, Replica and Mip-NeRF 360, the paper reports a 33.5-61.0% reduction in representation units while preserving rendering quality.
+
+
 ## Installation
 
 1. Clone the repository locally:
