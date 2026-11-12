@@ -2,6 +2,12 @@
 
 Anchor-based instantiation of SGDC, built on top of [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/). The primitive-based instantiation on Gaussian Grouping is available at [sgdc-gs](https://github.com/yuweidong/sgdc-gs).
 
+## Recognition
+
+This work was named a semifinalist in the Computer Science category of the 2026 [S.-T. Yau High School Science Award](https://www.yau-awards.com/) (China Mainland Division): 入围 2026 丘成桐中学科学奖（计算机）半决赛.
+
+The official semifinalist lists, in Chinese and English, are archived under [docs/](docs/).
+
 ## Technical roadmap
 
 SGDC is a density-control hook inside the training loop, not a new network and not a change to the rasterizer. Between iteration 4,000 and 15,000 it runs every 500 iterations. Each pass reads two quantities for every representation unit: the semantic confidence `c_i` and the accumulated gradient. It then applies three decisions in a fixed order and returns the updated unit set `U'` to the next iteration. A unit is an anchor in this repository and an individual Gaussian in the companion primitive-based repository. All three decisions consume the same confidence and gradient, so the diagram below is one pass of a single controller rather than three independent algorithms.
