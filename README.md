@@ -1,4 +1,12 @@
-# Semantic-Guided Density Control for Compact Semantic 3D Gaussian Splatting
+<div align="center">
+
+# 🧊 Semantic-Guided Density Control for Compact Semantic 3D Gaussian Splatting
+
+<p>
+  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-green.svg">
+  <img alt="Computers & Graphics 2026" src="https://img.shields.io/badge/Computers_%26_Graphics-2026-red.svg">
+  <img alt="visitors" src="https://komarev.com/ghpvc/?username=yuweidong&repo=sgdc-gs&label=Visitors&color=blue">
+</p>
 
 Anchor-based instantiation of SGDC, built on top of [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/). The primitive-based instantiation on Gaussian Grouping is available at [sgdc-gs](https://github.com/yuweidong/sgdc-gs).
 
