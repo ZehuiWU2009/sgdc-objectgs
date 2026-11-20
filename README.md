@@ -8,7 +8,7 @@
   <img alt="visitors" src="https://komarev.com/ghpvc/?username=yuweidong&repo=sgdc-gs&label=Visitors&color=blue">
 </p>
 
-Anchor-based instantiation of SGDC, built on top of [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/). The primitive-based instantiation on Gaussian Grouping is available at [sgdc-gs](https://github.com/yuweidong/sgdc-gs).
+> **Note on implementations:** This repo is the **anchor-based** instantiation of SGDC, built on top of [ObjectGS](https://github.com/RuijieZhu94/ObjectGS/). A **primitive-based** instantiation of SGDC on [Gaussian Grouping](https://github.com/lkeab/gaussian-grouping/) lives at [sgdc-gs](https://github.com/yuweidong/sgdc-gs/). 
 
 ## Recognition
 
